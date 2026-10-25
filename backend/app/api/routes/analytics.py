@@ -1,0 +1,43 @@
+
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, HTTPException, Query
+
+from app.analysis.metrics import compare_forecasts
+from app.services.elexon import (
+    fetch_wind_actuals,
+    fetch_wind_forecasts,
+)
+
+router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
+
+
+@router.get("/wind-accuracy")
+async def get_wind_accuracy(
+    days: int = Query(default=7, ge=1, le=30),
+):
+    """Compare available wind forecasts with actual generation."""
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    try:
+        actuals = await fetch_wind_actuals(start, end)
+        forecasts = await fetch_wind_forecasts(start, end)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not retrieve wind data from Elexon.",
+        ) from exc
+
+    result = compare_forecasts(forecasts, actuals)
+
+    return {
+        "source": "Elexon BMRS",
+        "period": {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "days": days,
+        },
+        **result,
+    }

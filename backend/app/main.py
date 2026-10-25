@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.wind import router as wind_router
+from app.api.routes.analytics import router as analytics_router
 
 app = FastAPI(
     title="Wind Forecast Analytics API",
@@ -19,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(wind_router)
+app.include_router(analytics_router)
 
 @app.get("/api/health", tags=["Health"])
 async def health_check():
