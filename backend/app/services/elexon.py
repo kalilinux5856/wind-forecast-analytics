@@ -29,16 +29,16 @@ async def fetch_wind_actuals(
 
     return data if isinstance(data, list) else data.get("data", [])
 
-
 async def fetch_wind_forecasts(
     start: datetime,
     end: datetime,
 ) -> list[dict]:
-    """Fetch wind generation forecast records for a time range."""
+    """Fetch wind forecast records published during a time range."""
 
     params = {
-        "from": start.isoformat(),
-        "to": end.isoformat(),
+        "publishDateTimeFrom": start.isoformat(),
+        "publishDateTimeTo": end.isoformat(),
+        "format": "json",
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:

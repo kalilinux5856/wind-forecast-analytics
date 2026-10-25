@@ -1,6 +1,4 @@
-
-from datetime import datetime
-
+from datetime import datetime, timedelta
 import math
 
 
@@ -12,133 +10,160 @@ def parse_datetime(value: str) -> datetime:
 def compare_forecasts(
     forecasts: list[dict],
     actuals: list[dict],
+    lead_hours: int = 1,
 ) -> dict:
     """
-    Match forecasts to actuals by delivery interval.
+    Compare hourly forecasts with hourly averages of actual generation.
 
-    Selection rule: for each delivery interval, select the most
-    recently published forecast available at or before that
-    interval's start time.
+    For each delivery hour, select the latest forecast published
+    at or before delivery time minus the requested lead time.
 
-    Error convention: forecast - actual.
+    Error = forecast - actual.
     """
 
-    # Keep the latest published actual record for each interval.
+    if lead_hours < 0:
+        raise ValueError("lead_hours must be non-negative")
+
+    # Keep the latest published actual for each half-hourly interval.
     actual_by_interval = {}
 
     for row in actuals:
-        start_time = row.get("startTime")
-        generation = row.get("generation")
-
-        if start_time is None or generation is None:
-            continue
-
         try:
-            actual_value = float(generation)
-            interval_time = parse_datetime(start_time)
-            publish_time = parse_datetime(
-                row.get("publishTime") or start_time
+            start = parse_datetime(row["startTime"])
+            generation = float(row["generation"])
+            published = parse_datetime(
+                row.get("publishTime") or row["startTime"]
             )
-        except (ValueError, TypeError):
+        except (KeyError, ValueError, TypeError):
             continue
 
-        key = interval_time.isoformat()
-        existing = actual_by_interval.get(key)
+        key = start.isoformat()
+        previous = actual_by_interval.get(key)
 
-        if existing is None or publish_time > existing["publish_time"]:
+        if previous is None or published > previous["publish_time"]:
             actual_by_interval[key] = {
-                "interval_time": interval_time,
-                "publish_time": publish_time,
-                "actual": actual_value,
+                "start": start,
+                "publish_time": published,
+                "generation": generation,
             }
 
-    # Choose the latest forecast published no later than
-    # the start of its delivery interval.
-    forecast_by_interval = {}
+    # Group actual observations into UTC clock hours.
+    hourly_actuals = {}
+
+    for row in actual_by_interval.values():
+        hour = row["start"].replace(minute=0, second=0, microsecond=0)
+        hourly_actuals.setdefault(hour.isoformat(), []).append(
+            row["generation"]
+        )
+
+    actual_by_hour = {
+        hour: sum(values) / len(values)
+        for hour, values in hourly_actuals.items()
+    }
+
+    # Group forecast revisions by delivery timestamp.
+    forecasts_by_delivery = {}
 
     for row in forecasts:
-        start_time = row.get("startTime")
-        publish_time = row.get("publishTime")
-        generation = row.get("generation")
-
-        if not start_time or not publish_time or generation is None:
-            continue
-
         try:
-            interval_time = parse_datetime(start_time)
-            published_at = parse_datetime(publish_time)
-            forecast_value = float(generation)
-        except (ValueError, TypeError):
+            delivery = parse_datetime(row["startTime"])
+            published = parse_datetime(row["publishTime"])
+            generation = float(row["generation"])
+        except (KeyError, ValueError, TypeError):
             continue
 
-        if published_at > interval_time:
-            continue
+        forecasts_by_delivery.setdefault(
+            delivery.isoformat(), []
+        ).append({
+            "delivery": delivery,
+            "published": published,
+            "generation": generation,
+        })
 
-        key = interval_time.isoformat()
-        existing = forecast_by_interval.get(key)
-
-        if (
-            existing is None
-            or published_at > existing["publish_time"]
-        ):
-            forecast_by_interval[key] = {
-                "interval_time": interval_time,
-                "publish_time": published_at,
-                "forecast": forecast_value,
-            }
-
-    # Match the selected forecast to the actual for each interval.
     matched = []
+    eligible_forecast_hours = 0
 
-    for key, forecast_row in forecast_by_interval.items():
-        actual_row = actual_by_interval.get(key)
+    for delivery_key, revisions in forecasts_by_delivery.items():
+        delivery = revisions[0]["delivery"]
+        hour_key = delivery.replace(
+            minute=0, second=0, microsecond=0
+        ).isoformat()
 
-        if actual_row is None:
+        if hour_key not in actual_by_hour:
             continue
 
-        forecast_value = forecast_row["forecast"]
-        actual_value = actual_row["actual"]
-        error = forecast_value - actual_value
+        cutoff = delivery - timedelta(hours=lead_hours)
+        eligible = [
+            revision for revision in revisions
+            if revision["published"] <= cutoff
+        ]
+
+        if not eligible:
+            continue
+
+        eligible_forecast_hours += 1
+        selected = max(eligible, key=lambda item: item["published"])
+
+        actual = actual_by_hour[hour_key]
+        forecast = selected["generation"]
+        error = forecast - actual
 
         matched.append({
-            "startTime": forecast_row["interval_time"].isoformat(),
-            "forecastPublishTime": forecast_row["publish_time"].isoformat(),
-            "forecast": forecast_value,
-            "actual": actual_value,
+            "startTime": delivery.isoformat(),
+            "forecastPublishTime": selected["published"].isoformat(),
+            "forecast": forecast,
+            "actual": actual,
             "error": error,
             "absoluteError": abs(error),
         })
 
-    matched.sort(key=lambda row: row["startTime"])
+    # If duplicate forecast delivery timestamps map to the same
+    # actual hour, retain one forecast per actual hour.
+    matched_by_hour = {}
+
+    for row in matched:
+        hour_key = parse_datetime(row["startTime"]).replace(
+            minute=0, second=0, microsecond=0
+        ).isoformat()
+
+        previous = matched_by_hour.get(hour_key)
+        if previous is None or row["startTime"] < previous["startTime"]:
+            matched_by_hour[hour_key] = row
+
+    matched = sorted(
+        matched_by_hour.values(),
+        key=lambda row: row["startTime"],
+    )
 
     if not matched:
         return {
-            "selectionRule": "latest forecast published at or before interval start",
+            "selectionRule": (
+                "latest forecast published at or before "
+                "delivery time minus lead time"
+            ),
+            "leadHours": lead_hours,
             "errorConvention": "forecast - actual",
+            "actualAggregation": "mean of available half-hourly observations per UTC hour",
             "matchedIntervals": 0,
-            "unmatchedActualIntervals": len(actual_by_interval),
-            "unmatchedForecastIntervals": len(forecast_by_interval),
             "metrics": None,
             "data": [],
         }
 
     errors = [row["error"] for row in matched]
-    absolute_errors = [abs(error) for error in errors]
-
-    mae = sum(absolute_errors) / len(errors)
-    rmse = math.sqrt(sum(error ** 2 for error in errors) / len(errors))
-    bias = sum(errors) / len(errors)
 
     return {
-        "selectionRule": "latest forecast published at or before interval start",
+        "selectionRule": (
+            "latest forecast published at or before "
+            "delivery time minus lead time"
+        ),
+        "leadHours": lead_hours,
         "errorConvention": "forecast - actual",
+        "actualAggregation": "mean of available half-hourly observations per UTC hour",
         "matchedIntervals": len(matched),
-        "unmatchedActualIntervals": len(actual_by_interval) - len(matched),
-        "unmatchedForecastIntervals": len(forecast_by_interval) - len(matched),
         "metrics": {
-            "mae": round(mae, 2),
-            "rmse": round(rmse, 2),
-            "bias": round(bias, 2),
+            "mae": round(sum(abs(e) for e in errors) / len(errors), 2),
+            "rmse": round(math.sqrt(sum(e * e for e in errors) / len(errors)), 2),
+            "bias": round(sum(errors) / len(errors), 2),
         },
         "data": matched,
     }
